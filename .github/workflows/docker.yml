@@ -146,7 +146,7 @@ jobs:
 
       - name: Extract image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           labels: |
@@ -331,7 +331,7 @@ jobs:
 
       - name: Generate manifest tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           flavor: ${{ matrix.variant.tag_suffix != '' && format('suffix={0}', matrix.variant.tag_suffix) || '' }}
