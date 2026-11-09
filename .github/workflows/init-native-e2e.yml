@@ -1,0 +1,120 @@
+name: Init Native E2E
+
+# Cross-platform (linux / macos / windows) smoke tests for the per-subcommand
+# ``headroom init -g <target>`` flows. Each matrix cell drops a noop shim for
+# the target agent onto PATH and asserts ``headroom init -g <target>``
+# succeeds, writes the expected settings file, and (for claude/codex) places
+# hooks in the right place.
+#
+# Deliberately scoped to pull_request + push-to-main + workflow_dispatch to
+# avoid bloating CI minutes on every push to every feature branch. The Docker
+# init-e2e.yml still runs on every PR and provides the deeper functional
+# coverage; this workflow exists to catch platform-specific bugs (Windows
+# path separators, macos keychain prompts, PowerShell-vs-bash hook matchers)
+# that the single-platform Docker suite can miss.
+#
+# Extending to other commands (``headroom install``, ``headroom wrap``) is
+# expected to be a near-copy of this file. The shared composite action at
+# ``.github/actions/headroom-e2e-setup`` absorbs the Python + shim setup so
+# each per-command workflow only supplies its matrix and assertion steps.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "headroom/cli/init.py"
+      - "headroom/install/**"
+      - "e2e/_lib/**"
+      - "e2e/init/**"
+      - ".github/actions/headroom-e2e-setup/**"
+      - ".github/workflows/init-native-e2e.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+
+jobs:
+  init-native-e2e:
+    name: init-native-e2e (${{ matrix.target }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        target:
+          - claude
+          - codex
+          - copilot
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Headroom native e2e environment
+        id: e2e-setup
+        uses: ./.github/actions/headroom-e2e-setup
+        with:
+          python-version: "3.11"
+          install-mode: deps-only-proxy
+          shim-target: ${{ matrix.target }}
+
+      - name: Verify noop ${{ matrix.target }} shim is on PATH
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SHIM_DIR: ${{ steps.e2e-setup.outputs.shim-dir }}
+        run: |
+          set -euo pipefail
+          resolved="$(command -v "$TARGET" || true)"
+          if [ -z "$resolved" ]; then
+            echo "::error::No '$TARGET' noop shim was found on PATH"
+            exit 1
+          fi
+          if [ "$resolved" != "$SHIM_DIR/$TARGET" ]; then
+            echo "::error::Expected '$TARGET' to resolve to '$SHIM_DIR/$TARGET', got '$resolved'"
+            exit 1
+          fi
+          echo "Found $TARGET noop shim at $resolved"
+
+      - name: Run Headroom global initialization for ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          headroom init -g "${{ matrix.target }}"
+
+      - name: Assert ${{ matrix.target }} configuration
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+
+          case "$TARGET" in
+            claude)
+              settings="$HOME/.claude/settings.json"
+              [ -f "$settings" ] || fail "Claude settings file not found at $settings"
+              grep -q 'ANTHROPIC_BASE_URL' "$settings" || fail "Claude settings file does not contain ANTHROPIC_BASE_URL"
+              ;;
+            codex)
+              config="$HOME/.codex/config.toml"
+              hooks="$HOME/.codex/hooks.json"
+              [ -f "$config" ] || fail "Codex config file not found at $config"
+              [ -f "$hooks" ] || fail "Codex hooks file not found at $hooks"
+              grep -q 'Headroom' "$config" || fail "Codex config file does not contain Headroom"
+              ;;
+            copilot)
+              config="$HOME/.copilot/config.json"
+              [ -f "$config" ] || fail "Copilot config file not found at $config"
+              grep -q 'SessionStart' "$config" || fail "Copilot config file does not contain a SessionStart hook"
+              grep -q 'headroom-init-copilot' "$config" || fail "Copilot config file does not contain the Headroom SessionStart hook marker"
+              ;;
+            *)
+              fail "Unsupported target: $TARGET"
+              ;;
+          esac
+          echo "Verified $TARGET configuration"
