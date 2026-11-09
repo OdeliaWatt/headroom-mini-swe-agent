@@ -118,7 +118,7 @@ jobs:
 
       - name: Set up Python for version synchronization
         if: ${{ steps.version.outputs.version != '' }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
