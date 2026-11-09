@@ -1,0 +1,518 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to stamp into the image contents and exact image tag"
+        required: false
+        type: string
+      enable_ref_tags:
+        description: "Whether to emit branch/PR ref tags"
+        required: false
+        default: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the image contents and exact image tag"
+        required: false
+  release:
+    types: [published]
+
+# A merge spree pushes many commits to main; without this, each commit starts
+# a full multi-arch image build and they pile up against the 20-job concurrency
+# cap. Supersede all but the latest build for a given ref. cancel-in-progress is
+# scoped to main only so a release tag's publish (its own ref) is never killed.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # For cosign keyless signing via Sigstore OIDC
+
+
+jobs:
+  docker-build:
+    name: Build ${{ matrix.variant.name }} (${{ matrix.arch.name }})
+    runs-on: ${{ matrix.arch.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: default
+            target: runtime-default
+            tag_suffix: ""
+          - name: nonroot
+            target: runtime-nonroot
+            tag_suffix: "-nonroot"
+          - name: code
+            target: runtime-code
+            tag_suffix: "-code"
+          - name: code-nonroot
+            target: runtime-code-nonroot
+            tag_suffix: "-code-nonroot"
+          - name: slim
+            target: runtime-slim
+            tag_suffix: "-slim"
+          - name: slim-nonroot
+            target: runtime-slim-nonroot
+            tag_suffix: "-slim-nonroot"
+          - name: code-slim
+            target: runtime-code-slim
+            tag_suffix: "-code-slim"
+          - name: code-slim-nonroot
+            target: runtime-code-slim-nonroot
+            tag_suffix: "-code-slim-nonroot"
+        arch:
+          - name: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - name: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version and commit
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          raw_version="${INPUT_VERSION:-}"
+          if [ -z "$raw_version" ] && [ "$EVENT_NAME" = "release" ]; then
+            raw_version="$RELEASE_TAG"
+          fi
+          if [ -z "$raw_version" ] && [[ "$REF" == refs/tags/* ]]; then
+            raw_version="$REF_NAME"
+          fi
+
+          raw_version="$(printf '%s' "$raw_version" | tr -d '[:space:]')"
+          normalized="${raw_version#v}"
+          normalized="${normalized#V}"
+          short_sha="${GITHUB_SHA:0:7}"
+
+          {
+            echo "version=$normalized"
+            echo "short_sha=$short_sha"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$normalized" ]; then
+            echo "Resolved release version: $normalized"
+          else
+            echo "No explicit or release version is available; build-time version stamping will be skipped."
+          fi
+
+      - name: Set up Python for version synchronization
+        if: ${{ steps.version.outputs.version != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Synchronize package versions
+        if: ${{ steps.version.outputs.version != '' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python scripts/version-sync.py --version "$VERSION"
+
+      - name: Resolve lowercase image repository
+        id: image
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "name=${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.title=Headroom
+            org.opencontainers.image.description=Headroom container image for the ${{ matrix.variant.name }} variant on ${{ matrix.arch.name }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push single-architecture image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: ${{ matrix.variant.target }}
+          platforms: ${{ matrix.arch.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            HEADROOM_BUILD_VERSION=${{ steps.version.outputs.version }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.variant.name }}-${{ matrix.arch.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-${{ matrix.arch.name }}
+
+      - name: Extract and record image digest
+        id: digest
+        shell: bash
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_OUTPUTS: ${{ toJSON(steps.build.outputs) }}
+          VARIANT: ${{ matrix.variant.name }}
+          ARCH: ${{ matrix.arch.name }}
+        run: |
+          echo "Build metadata digest for ${VARIANT}/${ARCH}: '${BUILD_DIGEST}'"
+          if [ -z "$BUILD_DIGEST" ]; then
+            echo "::error::No image digest was returned in the build metadata for ${VARIANT} on ${ARCH}."
+            echo "Build outputs: ${BUILD_OUTPUTS}"
+            exit 1
+          fi
+          if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Build metadata returned an invalid image digest '${BUILD_DIGEST}' for ${VARIANT} on ${ARCH}."
+            echo "Build outputs: ${BUILD_OUTPUTS}"
+            exit 1
+          fi
+
+          marker="${RUNNER_TEMP}/digest-${VARIANT}-${ARCH}.txt"
+          printf '%s\n' "$BUILD_DIGEST" > "$marker"
+          if [ ! -s "$marker" ]; then
+            echo "::error::Failed to write the digest marker for ${VARIANT} on ${ARCH}."
+            exit 1
+          fi
+          echo "digest=$BUILD_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test native extension imports
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PLATFORM: ${{ matrix.arch.platform }}
+        run: |
+          docker run --rm --platform "$PLATFORM" --entrypoint python3 "${IMAGE}@${DIGEST}" -c '
+          import pydantic_core
+          from pydantic import BaseModel
+          from headroom._core import DiffCompressor, SmartCrusher
+          assert BaseModel is not None
+          print(f"native import smoke OK: pydantic_core, {DiffCompressor.__name__}, {SmartCrusher.__name__}")
+          '
+
+      - name: Upload architecture digest marker
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.variant.name }}-${{ matrix.arch.name }}
+          path: ${{ runner.temp }}/digest-${{ matrix.variant.name }}-${{ matrix.arch.name }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Merge and sign ${{ matrix.variant.name }} manifest
+    needs: docker-build
+    if: ${{ needs.docker-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: default
+            tag_suffix: ""
+          - name: nonroot
+            tag_suffix: "-nonroot"
+          - name: code
+            tag_suffix: "-code"
+          - name: code-nonroot
+            tag_suffix: "-code-nonroot"
+          - name: slim
+            tag_suffix: "-slim"
+          - name: slim-nonroot
+            tag_suffix: "-slim-nonroot"
+          - name: code-slim
+            tag_suffix: "-code-slim"
+          - name: code-slim-nonroot
+            tag_suffix: "-code-slim-nonroot"
+    steps:
+      - name: Resolve version and commit
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          raw_version="${INPUT_VERSION:-}"
+          if [ -z "$raw_version" ] && [ "$EVENT_NAME" = "release" ]; then
+            raw_version="$RELEASE_TAG"
+          fi
+          if [ -z "$raw_version" ] && [[ "$REF" == refs/tags/* ]]; then
+            raw_version="$REF_NAME"
+          fi
+
+          raw_version="$(printf '%s' "$raw_version" | tr -d '[:space:]')"
+          normalized="${raw_version#v}"
+          normalized="${normalized#V}"
+
+          {
+            echo "version=$normalized"
+            echo "short_sha=${GITHUB_SHA:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve lowercase image repository
+        id: image
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "name=${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digest markers for variant
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.variant.name }}-*
+          path: ${{ runner.temp }}/digests-${{ matrix.variant.name }}
+          merge-multiple: true
+
+      - name: Collect architecture digests
+        id: digests
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          VARIANT: ${{ matrix.variant.name }}
+        run: |
+          digest_dir="${RUNNER_TEMP}/digests-${VARIANT}"
+          shopt -s nullglob
+          digest_files=("$digest_dir"/*.txt)
+
+          if [ "${#digest_files[@]}" -eq 0 ]; then
+            echo "::error::No architecture digest markers were found for variant ${VARIANT}."
+            exit 1
+          fi
+
+          sources=()
+          for digest_file in "${digest_files[@]}"; do
+            digest="$(tr -d '[:space:]' < "$digest_file")"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid digest '$digest' in ${digest_file}."
+              exit 1
+            fi
+            sources+=("${IMAGE}@${digest}")
+          done
+
+          sources_file="${RUNNER_TEMP}/sources-${VARIANT}.txt"
+          printf '%s\n' "${sources[@]}" > "$sources_file"
+          echo "Collected ${#sources[@]} architecture digest(s) for ${VARIANT}."
+          echo "count=${#sources[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate manifest tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          flavor: ${{ matrix.variant.tag_suffix != '' && format('suffix={0}', matrix.variant.tag_suffix) || '' }}
+          tags: |
+            type=ref,event=branch,enable=${{ github.event_name != 'release' && inputs.enable_ref_tags != 'false' }}
+            type=ref,event=pr,enable=${{ github.event_name != 'release' && inputs.enable_ref_tags != 'false' }}
+            type=edge,branch=main,enable=${{ github.event_name == 'push' && inputs.enable_ref_tags != 'false' }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }}
+            type=raw,value=${{ steps.version.outputs.version }}-${{ steps.version.outputs.short_sha }},enable=${{ steps.version.outputs.version != '' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+
+      - name: Prepare manifest tag list
+        id: tags
+        shell: bash
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          VARIANT: ${{ matrix.variant.name }}
+        run: |
+          tags_file="${RUNNER_TEMP}/tags-${VARIANT}.txt"
+          : > "$tags_file"
+
+          if [ -n "$TAGS" ]; then
+            printf '%s\n' "$TAGS" | sed '/^[[:space:]]*$/d' > "$tags_file"
+          fi
+
+          if [ "$VARIANT" != "default" ]; then
+            printf '%s:%s\n' "$IMAGE" "$VARIANT" >> "$tags_file"
+          fi
+
+          if [ -s "$tags_file" ]; then
+            first_tag="$(head -n 1 "$tags_file")"
+            echo "has_tags=true" >> "$GITHUB_OUTPUT"
+            echo "first_tag=$first_tag" >> "$GITHUB_OUTPUT"
+            echo "Generated tags:"
+            cat "$tags_file"
+          else
+            echo "has_tags=false" >> "$GITHUB_OUTPUT"
+            echo "No tags were generated for this event and input combination."
+          fi
+
+      - name: Create multi-architecture manifest
+        id: manifest
+        shell: bash
+        env:
+          HAS_TAGS: ${{ steps.tags.outputs.has_tags }}
+          VARIANT: ${{ matrix.variant.name }}
+        run: |
+          tags_file="${RUNNER_TEMP}/tags-${VARIANT}.txt"
+          sources_file="${RUNNER_TEMP}/sources-${VARIANT}.txt"
+
+          if [ "$HAS_TAGS" != "true" ]; then
+            echo "Digest set is non-empty, but no tags were generated; skipping manifest creation and signing."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tag_args=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              tag_args+=(--tag "$tag")
+            fi
+          done < "$tags_file"
+
+          mapfile -t sources < "$sources_file"
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve published manifest digest
+        id: index
+        if: ${{ steps.manifest.outputs.created == 'true' }}
+        shell: bash
+        env:
+          FIRST_TAG: ${{ steps.tags.outputs.first_tag }}
+        run: |
+          if [ -z "$FIRST_TAG" ]; then
+            echo "::error::No generated tag is available for manifest inspection."
+            exit 1
+          fi
+
+          descriptor="$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Manifest}}')"
+          echo "Manifest descriptor for ${FIRST_TAG}: ${descriptor}"
+          digest="$(printf '%s' "$descriptor" | jq -r '.digest // .Digest // empty')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::GHCR returned no valid multi-architecture index digest for ${FIRST_TAG}."
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: ${{ steps.manifest.outputs.created == 'true' }}
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign multi-architecture index
+        if: ${{ steps.index.outputs.digest != '' }}
+        shell: bash
+        env:
+          COSIGN_REPOSITORY: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}-signatures
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          echo "Signing ${IMAGE}@${DIGEST} with keyless Sigstore OIDC."
+          echo "Signature repository: ${COSIGN_REPOSITORY}"
+
+          delay=10
+          for attempt in 1 2 3 4 5; do
+            if cosign sign --yes "${IMAGE}@${DIGEST}"; then
+              echo "Image index signature published successfully."
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 5 ]; then
+              echo "Signing attempt ${attempt} failed; retrying in ${delay} seconds."
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+
+          echo "::error::Failed to sign ${IMAGE}@${DIGEST} after 5 attempts. Published tags and index were left intact."
+          exit 1
+
+  promote-latest:
+    name: Promote default variant to latest
+    needs: docker-manifest
+    if: ${{ needs.docker-manifest.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          raw_version="${INPUT_VERSION:-}"
+          if [ -z "$raw_version" ] && [ "$EVENT_NAME" = "release" ]; then
+            raw_version="$RELEASE_TAG"
+          fi
+          if [ -z "$raw_version" ] && [[ "$REF" == refs/tags/* ]]; then
+            raw_version="$REF_NAME"
+          fi
+
+          raw_version="$(printf '%s' "$raw_version" | tr -d '[:space:]')"
+          normalized="${raw_version#v}"
+          normalized="${normalized#V}"
+          echo "version=$normalized" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve lowercase image repository
+        id: image
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "name=${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote versioned default image to latest
+        if: ${{ steps.version.outputs.version != '' }}
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          source_image="${IMAGE}:${VERSION}"
+          latest_image="${IMAGE}:latest"
+          promoted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          docker buildx imagetools create \
+            --tag "$latest_image" \
+            --annotation "org.opencontainers.image.created=${promoted_at}" \
+            --annotation "io.github.headroomlabs-ai.headroom.promoted-at=${promoted_at}" \
+            "$source_image"
